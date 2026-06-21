@@ -11,7 +11,7 @@ const config = {
   ip: 'azuardnet.aternos.me',
   port: 13592,
   name: 'afk_bot',
-  version: '1.21.1'   // versi yang didukung mineflayer, ViaVersion handle sisanya
+  version: '1.21.1'
 };
 
 let bot = null;
@@ -31,36 +31,32 @@ function addLog(message, type = 'info') {
   console.log(`[${entry.time}] [${type.toUpperCase()}] ${message}`);
 }
 
-// ── Parse pesan kick (bisa string/objek/JSON) ────────────────
+// ── Parse pesan kick ─────────────────────────────────────────
 function parseKickReason(reason) {
   if (!reason) return 'Tidak ada alasan';
+
+  // Kalau sudah object langsung
+  if (typeof reason === 'object') {
+    // Format mineflayer compound: { type:'compound', value:{ translate:{ value:'...' } } }
+    if (reason.value?.translate?.value) return reason.value.translate.value;
+    if (reason.value?.text?.value)      return reason.value.text.value;
+    return JSON.stringify(reason);
+  }
+
+  // Kalau string, coba parse JSON
   if (typeof reason === 'string') {
     try {
-      const parsed = JSON.parse(reason);
-      // Format { text: "...", extra: [...] }
-      if (parsed.text !== undefined) {
-        let msg = parsed.text;
-        if (parsed.extra) {
-          msg += parsed.extra.map(e => (typeof e === 'object' ? e.text || '' : e)).join('');
-        }
-        return msg || JSON.stringify(parsed);
-      }
-      return JSON.stringify(parsed);
+      const p = JSON.parse(reason);
+      if (p.value?.translate?.value) return p.value.translate.value;
+      if (p.value?.text?.value)      return p.value.text.value;
+      if (p.translate)               return p.translate;
+      if (p.text)                    return p.text;
+      return JSON.stringify(p);
     } catch (_) {
       return reason;
     }
   }
-  if (typeof reason === 'object') {
-    // Sudah jadi objek
-    if (reason.text !== undefined) {
-      let msg = reason.text;
-      if (reason.extra) {
-        msg += reason.extra.map(e => (typeof e === 'object' ? e.text || '' : e)).join('');
-      }
-      return msg || JSON.stringify(reason);
-    }
-    return JSON.stringify(reason);
-  }
+
   return String(reason);
 }
 
@@ -81,7 +77,9 @@ function startBot() {
       username: config.name,
       version: config.version,
       auth: 'offline',
-      hideErrors: false
+      hideErrors: false,
+      // Nonaktifkan physics agar tidak ada gerakan otomatis
+      physicsEnabled: false
     });
   } catch (e) {
     addLog('Gagal membuat bot: ' + e.message, 'error');
@@ -90,50 +88,25 @@ function startBot() {
     return { ok: false };
   }
 
-  let lasttime = -1;
-  let moving = 0;
-  let lastaction;
-  const actions = ['forward', 'back', 'left', 'right'];
-  const moveinterval = 2;
-  const maxrandom = 5;
-
   bot.on('login', () => {
     botStatus = 'online';
     addLog(`Login berhasil sebagai "${config.name}"`, 'success');
   });
 
   bot.on('spawn', () => {
-    addLog('Bot telah spawn di dunia', 'success');
-  });
+    addLog('Bot spawn di dunia — mode diam (no movement)', 'success');
 
-  bot.on('time', () => {
-    if (botStatus !== 'online') return;
-    if (lasttime < 0) {
-      lasttime = bot.time.age;
-    } else {
-      const randomadd = Math.random() * maxrandom * 20;
-      const interval = moveinterval * 20 + randomadd;
-      if (bot.time.age - lasttime > interval) {
-        if (moving === 1) {
-          bot.setControlState(lastaction, false);
-          moving = 0;
-          lasttime = bot.time.age;
-        } else {
-          const yaw = Math.random() * Math.PI - 0.5 * Math.PI;
-          const pitch = Math.random() * Math.PI - 0.5 * Math.PI;
-          bot.look(yaw, pitch, false);
-          lastaction = actions[Math.floor(Math.random() * actions.length)];
-          bot.setControlState(lastaction, true);
-          moving = 1;
-          lasttime = bot.time.age;
-          bot.activateItem();
-          addLog('AFK move: ' + lastaction, 'info');
-        }
-      }
-    }
+    // Pastikan semua kontrol gerakan mati
+    bot.clearControlStates();
+
+    // Sneak agar tidak jatuh dari tepi
+    bot.setControlState('sneak', true);
+
+    addLog('Bot aktif AFK — diam di tempat', 'info');
   });
 
   bot.on('chat', (username, message) => {
+    if (username === config.name) return; // abaikan chat bot sendiri
     addLog(`[Chat] <${username}> ${message}`, 'info');
   });
 
@@ -145,14 +118,19 @@ function startBot() {
   });
 
   bot.on('error', (err) => {
-    addLog('Error: ' + err.message, 'error');
+    // Abaikan error ECONNRESET biasa
+    if (err.message.includes('ECONNRESET') || err.message.includes('ENOTFOUND')) {
+      addLog('Koneksi terputus (network): ' + err.message, 'warn');
+    } else {
+      addLog('Error: ' + err.message, 'error');
+    }
     botStatus = 'error';
     bot = null;
   });
 
   bot.on('end', (reason) => {
-    if (botStatus !== 'offline') {
-      addLog('Koneksi bot terputus' + (reason ? ': ' + reason : ''), 'warn');
+    if (botStatus === 'online' || botStatus === 'connecting') {
+      addLog('Koneksi terputus' + (reason ? ': ' + reason : ''), 'warn');
     }
     botStatus = 'offline';
     bot = null;
@@ -167,7 +145,10 @@ function stopBot() {
     addLog('Bot tidak sedang berjalan.', 'warn');
     return { ok: false, message: 'Bot tidak berjalan' };
   }
-  try { bot.quit('Stopped by panel'); } catch (_) {}
+  try {
+    bot.clearControlStates();
+    bot.quit('Stopped by panel');
+  } catch (_) {}
   bot = null;
   botStatus = 'offline';
   addLog('Bot dihentikan oleh panel', 'warn');
