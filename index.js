@@ -10,7 +10,8 @@ app.use(express.json());
 const config = {
   ip: 'azuardnet.aternos.me',
   port: 13592,
-  name: 'afk_bot'
+  name: 'afk_bot',
+  version: '1.21.1'   // versi yang didukung mineflayer, ViaVersion handle sisanya
 };
 
 let bot = null;
@@ -30,6 +31,39 @@ function addLog(message, type = 'info') {
   console.log(`[${entry.time}] [${type.toUpperCase()}] ${message}`);
 }
 
+// ── Parse pesan kick (bisa string/objek/JSON) ────────────────
+function parseKickReason(reason) {
+  if (!reason) return 'Tidak ada alasan';
+  if (typeof reason === 'string') {
+    try {
+      const parsed = JSON.parse(reason);
+      // Format { text: "...", extra: [...] }
+      if (parsed.text !== undefined) {
+        let msg = parsed.text;
+        if (parsed.extra) {
+          msg += parsed.extra.map(e => (typeof e === 'object' ? e.text || '' : e)).join('');
+        }
+        return msg || JSON.stringify(parsed);
+      }
+      return JSON.stringify(parsed);
+    } catch (_) {
+      return reason;
+    }
+  }
+  if (typeof reason === 'object') {
+    // Sudah jadi objek
+    if (reason.text !== undefined) {
+      let msg = reason.text;
+      if (reason.extra) {
+        msg += reason.extra.map(e => (typeof e === 'object' ? e.text || '' : e)).join('');
+      }
+      return msg || JSON.stringify(reason);
+    }
+    return JSON.stringify(reason);
+  }
+  return String(reason);
+}
+
 // ── Start Bot ────────────────────────────────────────────────
 function startBot() {
   if (bot) {
@@ -38,15 +72,23 @@ function startBot() {
   }
 
   botStatus = 'connecting';
-  addLog(`Menghubungkan ke ${config.ip}:${config.port} sebagai "${config.name}"...`, 'info');
+  addLog(`Menghubungkan ke ${config.ip}:${config.port} (v${config.version}) sebagai "${config.name}"...`, 'info');
 
-  bot = mineflayer.createBot({
-    host: config.ip,
-    port: config.port,
-    username: config.name,
-    version: false,
-    auth: 'offline'
-  });
+  try {
+    bot = mineflayer.createBot({
+      host: config.ip,
+      port: parseInt(config.port),
+      username: config.name,
+      version: config.version,
+      auth: 'offline',
+      hideErrors: false
+    });
+  } catch (e) {
+    addLog('Gagal membuat bot: ' + e.message, 'error');
+    botStatus = 'error';
+    bot = null;
+    return { ok: false };
+  }
 
   let lasttime = -1;
   let moving = 0;
@@ -95,9 +137,9 @@ function startBot() {
     addLog(`[Chat] <${username}> ${message}`, 'info');
   });
 
-  bot.on('kicked', (reason) => {
-    try { reason = JSON.parse(reason)?.text || reason; } catch (_) {}
-    addLog('Bot di-kick: ' + reason, 'error');
+  bot.on('kicked', (reason, loggedIn) => {
+    const msg = parseKickReason(reason);
+    addLog(`Bot di-kick${loggedIn ? ' setelah login' : ''}: ${msg}`, 'error');
     botStatus = 'offline';
     bot = null;
   });
@@ -108,8 +150,10 @@ function startBot() {
     bot = null;
   });
 
-  bot.on('end', () => {
-    addLog('Koneksi bot terputus', 'warn');
+  bot.on('end', (reason) => {
+    if (botStatus !== 'offline') {
+      addLog('Koneksi bot terputus' + (reason ? ': ' + reason : ''), 'warn');
+    }
     botStatus = 'offline';
     bot = null;
   });
@@ -123,7 +167,7 @@ function stopBot() {
     addLog('Bot tidak sedang berjalan.', 'warn');
     return { ok: false, message: 'Bot tidak berjalan' };
   }
-  bot.quit('Stopped by panel');
+  try { bot.quit('Stopped by panel'); } catch (_) {}
   bot = null;
   botStatus = 'offline';
   addLog('Bot dihentikan oleh panel', 'warn');
@@ -136,7 +180,7 @@ app.get('/', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({ status: botStatus, config });
+  res.json({ status: botStatus, config: { ip: config.ip, port: config.port, name: config.name, version: config.version } });
 });
 
 app.get('/logs', (req, res) => {
