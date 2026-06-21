@@ -6,18 +6,24 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Konfigurasi Bot ──────────────────────────────────────────
+// ── Konfigurasi ──────────────────────────────────────────────
 const config = {
   ip: 'azuardnet.aternos.me',
   port: 13592,
   name: 'afk_bot',
-  version: '1.21.1'
+  version: '1.21.1',
+  reconnectDelay: 15,   // detik tunggu sebelum reconnect
+  maxReconnectDelay: 120 // maksimal delay (detik) saat server mati
 };
 
 let bot = null;
 let botStatus = 'offline';
 let logs = [];
 let lookInterval = null;
+let reconnectTimer = null;
+let reconnectCount = 0;
+let autoReconnect = false; // hanya aktif kalau user klik Start
+let currentDelay = config.reconnectDelay;
 const MAX_LOGS = 300;
 
 // ── Logger ───────────────────────────────────────────────────
@@ -32,7 +38,7 @@ function addLog(message, type = 'info') {
   console.log(`[${entry.time}] [${type.toUpperCase()}] ${message}`);
 }
 
-// ── Parse pesan kick ─────────────────────────────────────────
+// ── Parse kick reason ────────────────────────────────────────
 function parseKickReason(reason) {
   if (!reason) return 'Tidak ada alasan';
   if (typeof reason === 'object') {
@@ -48,58 +54,81 @@ function parseKickReason(reason) {
       if (p.translate)               return p.translate;
       if (p.text)                    return p.text;
       return JSON.stringify(p);
-    } catch (_) {
-      return reason;
-    }
+    } catch (_) { return reason; }
   }
   return String(reason);
 }
 
-// ── Anti-idle: putar kepala pelan & natural ──────────────────
+// ── Anti-idle: putar kepala ──────────────────────────────────
 function startAntiIdle() {
-  if (lookInterval) clearInterval(lookInterval);
-
-  // Kepala berputar perlahan setiap 30-60 detik (random)
-  // Hanya yaw (kiri-kanan), pitch sedikit (tidak lompat-lompat)
+  stopAntiIdle();
   let step = 0;
   const schedule = () => {
-    const delay = (30 + Math.random() * 30) * 1000; // 30–60 detik
+    const delay = (30 + Math.random() * 30) * 1000;
     lookInterval = setTimeout(() => {
       if (!bot || botStatus !== 'online') return;
       try {
-        // Putar kepala ke arah random secara halus
-        const yaw   = (Math.random() * 2 - 1) * Math.PI; // -180° sampai 180°
-        const pitch = (Math.random() * 0.4) - 0.2;        // sedikit atas/bawah
-        bot.look(yaw, pitch, true); // true = interpolasi halus
+        const yaw   = (Math.random() * 2 - 1) * Math.PI;
+        const pitch = (Math.random() * 0.4) - 0.2;
+        bot.look(yaw, pitch, true);
         step++;
-        if (step % 5 === 0) {
-          addLog(`Anti-idle: rotasi kepala ke-${step}`, 'info');
-        }
+        if (step % 5 === 0) addLog(`Anti-idle aktif (rotasi ke-${step})`, 'info');
       } catch (_) {}
-      schedule(); // jadwalkan lagi
+      schedule();
     }, delay);
   };
-
   schedule();
-  addLog('Anti-idle aktif — rotasi kepala setiap 30-60 detik', 'success');
+  addLog('Anti-idle aktif', 'success');
 }
 
 function stopAntiIdle() {
-  if (lookInterval) {
-    clearTimeout(lookInterval);
-    lookInterval = null;
-  }
+  if (lookInterval) { clearTimeout(lookInterval); lookInterval = null; }
 }
 
-// ── Start Bot ────────────────────────────────────────────────
-function startBot() {
-  if (bot) {
-    addLog('Bot sudah berjalan.', 'warn');
-    return { ok: false, message: 'Bot sudah berjalan' };
+// ── Reconnect ────────────────────────────────────────────────
+function scheduleReconnect(reason) {
+  if (!autoReconnect) return;
+  if (reconnectTimer) return; // sudah ada timer
+
+  // Kalau server Aternos mati, tunggu lebih lama
+  const isServerDown = reason && (
+    reason.includes('idling') ||
+    reason.includes('socketClosed') ||
+    reason.includes('ECONNREFUSED') ||
+    reason.includes('ENOTFOUND') ||
+    reason.includes('ETIMEDOUT')
+  );
+
+  if (isServerDown) {
+    // Pakai exponential backoff: makin lama makin sabar
+    currentDelay = Math.min(currentDelay * 1.5, config.maxReconnectDelay);
+  } else {
+    currentDelay = config.reconnectDelay;
   }
 
+  const delayInt = Math.round(currentDelay);
+  botStatus = 'reconnecting';
+  addLog(`Reconnect ke-${reconnectCount + 1} dalam ${delayInt} detik...`, 'warn');
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!autoReconnect) return;
+    reconnectCount++;
+    addLog(`Mencoba reconnect ke-${reconnectCount}...`, 'info');
+    createBot();
+  }, delayInt * 1000);
+}
+
+function cancelReconnect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+}
+
+// ── Buat instance bot ────────────────────────────────────────
+function createBot() {
+  if (bot) return;
+
   botStatus = 'connecting';
-  addLog(`Menghubungkan ke ${config.ip}:${config.port} (v${config.version}) sebagai "${config.name}"...`, 'info');
+  addLog(`Menghubungkan ke ${config.ip}:${config.port} sebagai "${config.name}"...`, 'info');
 
   try {
     bot = mineflayer.createBot({
@@ -115,11 +144,14 @@ function startBot() {
     addLog('Gagal membuat bot: ' + e.message, 'error');
     botStatus = 'error';
     bot = null;
-    return { ok: false };
+    scheduleReconnect(e.message);
+    return;
   }
 
   bot.on('login', () => {
     botStatus = 'online';
+    reconnectCount = 0;
+    currentDelay = config.reconnectDelay; // reset delay kalau berhasil
     addLog(`Login berhasil sebagai "${config.name}"`, 'success');
   });
 
@@ -137,49 +169,57 @@ function startBot() {
 
   bot.on('kicked', (reason, loggedIn) => {
     const msg = parseKickReason(reason);
-    addLog(`Bot di-kick${loggedIn ? ' setelah login' : ''}: ${msg}`, 'error');
+    addLog(`Bot di-kick: ${msg}`, 'error');
     stopAntiIdle();
-    botStatus = 'offline';
     bot = null;
+    botStatus = 'offline';
+    scheduleReconnect(msg);
   });
 
   bot.on('error', (err) => {
-    if (err.message.includes('ECONNRESET') || err.message.includes('ENOTFOUND')) {
-      addLog('Koneksi terputus (network): ' + err.message, 'warn');
-    } else {
-      addLog('Error: ' + err.message, 'error');
-    }
+    addLog('Error: ' + err.message, 'warn');
     stopAntiIdle();
-    botStatus = 'error';
     bot = null;
+    botStatus = 'error';
+    scheduleReconnect(err.message);
   });
 
   bot.on('end', (reason) => {
-    if (botStatus === 'online' || botStatus === 'connecting') {
-      addLog('Koneksi terputus' + (reason ? ': ' + reason : ''), 'warn');
-    }
+    const wasOnline = botStatus === 'online' || botStatus === 'connecting';
+    if (wasOnline) addLog('Koneksi terputus' + (reason ? ': ' + reason : ''), 'warn');
     stopAntiIdle();
-    botStatus = 'offline';
     bot = null;
+    if (wasOnline) {
+      botStatus = 'offline';
+      scheduleReconnect(reason || '');
+    }
   });
+}
 
+// ── Start / Stop (dipanggil dari API) ────────────────────────
+function startBot() {
+  if (autoReconnect) {
+    addLog('Bot sudah berjalan.', 'warn');
+    return { ok: false, message: 'Bot sudah berjalan' };
+  }
+  autoReconnect = true;
+  reconnectCount = 0;
+  currentDelay = config.reconnectDelay;
+  addLog('Auto-reconnect diaktifkan', 'info');
+  createBot();
   return { ok: true };
 }
 
-// ── Stop Bot ─────────────────────────────────────────────────
 function stopBot() {
-  if (!bot) {
-    addLog('Bot tidak sedang berjalan.', 'warn');
-    return { ok: false, message: 'Bot tidak berjalan' };
-  }
+  autoReconnect = false;
+  cancelReconnect();
   stopAntiIdle();
-  try {
-    bot.clearControlStates();
-    bot.quit('Stopped by panel');
-  } catch (_) {}
-  bot = null;
+  if (bot) {
+    try { bot.clearControlStates(); bot.quit('Stopped by panel'); } catch (_) {}
+    bot = null;
+  }
   botStatus = 'offline';
-  addLog('Bot dihentikan oleh panel', 'warn');
+  addLog('Bot dihentikan — auto-reconnect dimatikan', 'warn');
   return { ok: true };
 }
 
@@ -189,7 +229,12 @@ app.get('/', (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({ status: botStatus, config: { ip: config.ip, port: config.port, name: config.name, version: config.version } });
+  res.json({
+    status: botStatus,
+    autoReconnect,
+    reconnectCount,
+    config: { ip: config.ip, port: config.port, name: config.name, version: config.version }
+  });
 });
 
 app.get('/logs', (req, res) => {
