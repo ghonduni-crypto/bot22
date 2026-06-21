@@ -17,6 +17,7 @@ const config = {
 let bot = null;
 let botStatus = 'offline';
 let logs = [];
+let lookInterval = null;
 const MAX_LOGS = 300;
 
 // ── Logger ───────────────────────────────────────────────────
@@ -34,16 +35,11 @@ function addLog(message, type = 'info') {
 // ── Parse pesan kick ─────────────────────────────────────────
 function parseKickReason(reason) {
   if (!reason) return 'Tidak ada alasan';
-
-  // Kalau sudah object langsung
   if (typeof reason === 'object') {
-    // Format mineflayer compound: { type:'compound', value:{ translate:{ value:'...' } } }
     if (reason.value?.translate?.value) return reason.value.translate.value;
     if (reason.value?.text?.value)      return reason.value.text.value;
     return JSON.stringify(reason);
   }
-
-  // Kalau string, coba parse JSON
   if (typeof reason === 'string') {
     try {
       const p = JSON.parse(reason);
@@ -56,8 +52,43 @@ function parseKickReason(reason) {
       return reason;
     }
   }
-
   return String(reason);
+}
+
+// ── Anti-idle: putar kepala pelan & natural ──────────────────
+function startAntiIdle() {
+  if (lookInterval) clearInterval(lookInterval);
+
+  // Kepala berputar perlahan setiap 30-60 detik (random)
+  // Hanya yaw (kiri-kanan), pitch sedikit (tidak lompat-lompat)
+  let step = 0;
+  const schedule = () => {
+    const delay = (30 + Math.random() * 30) * 1000; // 30–60 detik
+    lookInterval = setTimeout(() => {
+      if (!bot || botStatus !== 'online') return;
+      try {
+        // Putar kepala ke arah random secara halus
+        const yaw   = (Math.random() * 2 - 1) * Math.PI; // -180° sampai 180°
+        const pitch = (Math.random() * 0.4) - 0.2;        // sedikit atas/bawah
+        bot.look(yaw, pitch, true); // true = interpolasi halus
+        step++;
+        if (step % 5 === 0) {
+          addLog(`Anti-idle: rotasi kepala ke-${step}`, 'info');
+        }
+      } catch (_) {}
+      schedule(); // jadwalkan lagi
+    }, delay);
+  };
+
+  schedule();
+  addLog('Anti-idle aktif — rotasi kepala setiap 30-60 detik', 'success');
+}
+
+function stopAntiIdle() {
+  if (lookInterval) {
+    clearTimeout(lookInterval);
+    lookInterval = null;
+  }
 }
 
 // ── Start Bot ────────────────────────────────────────────────
@@ -78,7 +109,6 @@ function startBot() {
       version: config.version,
       auth: 'offline',
       hideErrors: false,
-      // Nonaktifkan physics agar tidak ada gerakan otomatis
       physicsEnabled: false
     });
   } catch (e) {
@@ -94,36 +124,32 @@ function startBot() {
   });
 
   bot.on('spawn', () => {
-    addLog('Bot spawn di dunia — mode diam (no movement)', 'success');
-
-    // Pastikan semua kontrol gerakan mati
+    addLog('Bot spawn di dunia', 'success');
     bot.clearControlStates();
-
-    // Sneak agar tidak jatuh dari tepi
     bot.setControlState('sneak', true);
-
-    addLog('Bot aktif AFK — diam di tempat', 'info');
+    startAntiIdle();
   });
 
   bot.on('chat', (username, message) => {
-    if (username === config.name) return; // abaikan chat bot sendiri
+    if (username === config.name) return;
     addLog(`[Chat] <${username}> ${message}`, 'info');
   });
 
   bot.on('kicked', (reason, loggedIn) => {
     const msg = parseKickReason(reason);
     addLog(`Bot di-kick${loggedIn ? ' setelah login' : ''}: ${msg}`, 'error');
+    stopAntiIdle();
     botStatus = 'offline';
     bot = null;
   });
 
   bot.on('error', (err) => {
-    // Abaikan error ECONNRESET biasa
     if (err.message.includes('ECONNRESET') || err.message.includes('ENOTFOUND')) {
       addLog('Koneksi terputus (network): ' + err.message, 'warn');
     } else {
       addLog('Error: ' + err.message, 'error');
     }
+    stopAntiIdle();
     botStatus = 'error';
     bot = null;
   });
@@ -132,6 +158,7 @@ function startBot() {
     if (botStatus === 'online' || botStatus === 'connecting') {
       addLog('Koneksi terputus' + (reason ? ': ' + reason : ''), 'warn');
     }
+    stopAntiIdle();
     botStatus = 'offline';
     bot = null;
   });
@@ -145,6 +172,7 @@ function stopBot() {
     addLog('Bot tidak sedang berjalan.', 'warn');
     return { ok: false, message: 'Bot tidak berjalan' };
   }
+  stopAntiIdle();
   try {
     bot.clearControlStates();
     bot.quit('Stopped by panel');
