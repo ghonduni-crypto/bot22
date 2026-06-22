@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const mineflayer = require('mineflayer');
+const mc = require('minecraft-protocol');
 
 const app = express();
 app.use(cors());
@@ -12,73 +12,72 @@ const config = {
   port: 13592,
   name: 'afk_bot',
   version: '1.21.1',
-  reconnectDelay: 15,   // detik tunggu sebelum reconnect
-  maxReconnectDelay: 120 // maksimal delay (detik) saat server mati
+  reconnectDelay: 15,
+  maxReconnectDelay: 120
 };
 
-let bot = null;
+let client = null;
 let botStatus = 'offline';
 let logs = [];
 let lookInterval = null;
 let reconnectTimer = null;
 let reconnectCount = 0;
-let autoReconnect = false; // hanya aktif kalau user klik Start
+let autoReconnect = false;
 let currentDelay = config.reconnectDelay;
 const MAX_LOGS = 300;
 
 // ── Logger ───────────────────────────────────────────────────
 function addLog(message, type = 'info') {
-  const entry = {
-    time: new Date().toLocaleTimeString('id-ID'),
-    message,
-    type
-  };
+  const entry = { time: new Date().toLocaleTimeString('id-ID'), message, type };
   logs.push(entry);
   if (logs.length > MAX_LOGS) logs.shift();
   console.log(`[${entry.time}] [${type.toUpperCase()}] ${message}`);
 }
 
-// ── Parse kick reason ────────────────────────────────────────
+// ── Parse kick ───────────────────────────────────────────────
 function parseKickReason(reason) {
   if (!reason) return 'Tidak ada alasan';
   if (typeof reason === 'object') {
     if (reason.value?.translate?.value) return reason.value.translate.value;
     if (reason.value?.text?.value)      return reason.value.text.value;
+    if (reason.translate)               return reason.translate;
+    if (reason.text)                    return reason.text;
     return JSON.stringify(reason);
   }
-  if (typeof reason === 'string') {
-    try {
-      const p = JSON.parse(reason);
-      if (p.value?.translate?.value) return p.value.translate.value;
-      if (p.value?.text?.value)      return p.value.text.value;
-      if (p.translate)               return p.translate;
-      if (p.text)                    return p.text;
-      return JSON.stringify(p);
-    } catch (_) { return reason; }
-  }
-  return String(reason);
+  try {
+    const p = JSON.parse(reason);
+    if (p.value?.translate?.value) return p.value.translate.value;
+    if (p.translate)               return p.translate;
+    if (p.text)                    return p.text;
+    return JSON.stringify(p);
+  } catch (_) { return String(reason); }
 }
 
 // ── Anti-idle: putar kepala ──────────────────────────────────
+let yaw = 0;
+let pitch = 0;
+
 function startAntiIdle() {
   stopAntiIdle();
-  let step = 0;
   const schedule = () => {
-    const delay = (30 + Math.random() * 30) * 1000;
+    const delay = (25 + Math.random() * 25) * 1000; // 25–50 detik
     lookInterval = setTimeout(() => {
-      if (!bot || botStatus !== 'online') return;
+      if (!client || botStatus !== 'online') return;
       try {
-        const yaw   = (Math.random() * 2 - 1) * Math.PI;
-        const pitch = (Math.random() * 0.4) - 0.2;
-        bot.look(yaw, pitch, true);
-        step++;
-        if (step % 5 === 0) addLog(`Anti-idle aktif (rotasi ke-${step})`, 'info');
+        // Kirim packet look langsung — paling reliable
+        yaw   = (Math.random() * 360);
+        pitch = (Math.random() * 20) - 10;
+        client.write('look', {
+          yaw: yaw,
+          pitch: pitch,
+          onGround: true
+        });
       } catch (_) {}
       schedule();
     }, delay);
   };
   schedule();
-  addLog('Anti-idle aktif', 'success');
+  addLog('Anti-idle aktif (look packet setiap 25-50 detik)', 'success');
 }
 
 function stopAntiIdle() {
@@ -88,19 +87,18 @@ function stopAntiIdle() {
 // ── Reconnect ────────────────────────────────────────────────
 function scheduleReconnect(reason) {
   if (!autoReconnect) return;
-  if (reconnectTimer) return; // sudah ada timer
+  if (reconnectTimer) return;
 
-  // Kalau server Aternos mati, tunggu lebih lama
   const isServerDown = reason && (
     reason.includes('idling') ||
     reason.includes('socketClosed') ||
     reason.includes('ECONNREFUSED') ||
     reason.includes('ENOTFOUND') ||
-    reason.includes('ETIMEDOUT')
+    reason.includes('ETIMEDOUT') ||
+    reason.includes('connect')
   );
 
   if (isServerDown) {
-    // Pakai exponential backoff: makin lama makin sabar
     currentDelay = Math.min(currentDelay * 1.5, config.maxReconnectDelay);
   } else {
     currentDelay = config.reconnectDelay;
@@ -123,86 +121,174 @@ function cancelReconnect() {
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
 }
 
-// ── Buat instance bot ────────────────────────────────────────
+// ── Buat koneksi bot pakai minecraft-protocol langsung ───────
 function createBot() {
-  if (bot) return;
+  if (client) return;
 
   botStatus = 'connecting';
   addLog(`Menghubungkan ke ${config.ip}:${config.port} sebagai "${config.name}"...`, 'info');
 
   try {
-    bot = mineflayer.createBot({
+    client = mc.createClient({
       host: config.ip,
       port: parseInt(config.port),
       username: config.name,
       version: config.version,
       auth: 'offline',
       hideErrors: false,
-      physicsEnabled: false
+      // Nonaktifkan fitur yang tidak perlu
+      keepAlive: true,
+      checkTimeoutInterval: 30000
     });
   } catch (e) {
-    addLog('Gagal membuat bot: ' + e.message, 'error');
+    addLog('Gagal membuat koneksi: ' + e.message, 'error');
     botStatus = 'error';
-    bot = null;
+    client = null;
     scheduleReconnect(e.message);
     return;
   }
 
-  bot.on('login', () => {
+  // ── Login berhasil ─────────────────────────────────────────
+  client.on('login', (packet) => {
     botStatus = 'online';
     reconnectCount = 0;
-    currentDelay = config.reconnectDelay; // reset delay kalau berhasil
-    addLog(`Login berhasil sebagai "${config.name}"`, 'success');
+    currentDelay = config.reconnectDelay;
+    addLog(`Login berhasil! EntityID: ${packet.entityId}`, 'success');
+
+    // Kirim client settings supaya server tahu bot siap
+    try {
+      client.write('settings', {
+        locale: 'en_US',
+        viewDistance: 2,
+        chatFlags: 0,
+        chatColors: false,
+        skinParts: 127,
+        mainHand: 1,
+        enableTextFiltering: false,
+        enableServerListing: true
+      });
+    } catch (_) {}
   });
 
-  // Auto-accept resource pack
-  bot.on('resource_pack_push', (pack) => {
-    addLog('Resource pack diterima: ' + (pack.url || 'unknown'), 'info');
-    bot.acceptResourcePack();
-  });
+  // ── Spawn / position ───────────────────────────────────────
+  client.on('position', (packet) => {
+    addLog(`Bot spawn — posisi X:${Math.round(packet.x)} Y:${Math.round(packet.y)} Z:${Math.round(packet.z)}`, 'success');
 
-  bot.on('spawn', () => {
-    addLog('Bot spawn di dunia', 'success');
-    bot.clearControlStates();
-    bot.setControlState('sneak', true);
+    // Konfirmasi posisi ke server (wajib di 1.17+)
+    try {
+      client.write('teleport_confirm', { teleportId: packet.teleportId });
+    } catch (_) {}
+
+    // Kirim posisi awal (diam di tempat)
+    try {
+      client.write('position_look', {
+        x: packet.x,
+        y: packet.y,
+        z: packet.z,
+        yaw: packet.yaw,
+        pitch: packet.pitch,
+        flags: 0,
+        onGround: true
+      });
+    } catch (_) {
+      try {
+        client.write('position', {
+          x: packet.x, y: packet.y, z: packet.z, onGround: true
+        });
+      } catch (_2) {}
+    }
+
     startAntiIdle();
   });
 
-  bot.on('chat', (username, message) => {
-    if (username === config.name) return;
-    addLog(`[Chat] <${username}> ${message}`, 'info');
+  // ── Resource pack — intercept packet langsung ──────────────
+  client.on('resource_pack_send', (packet) => {
+    addLog(`Resource pack diminta, auto-accept (hash: ${packet.hash || 'none'})`, 'info');
+    try {
+      // Kirim "accepted" ke server
+      client.write('resource_pack_receive', {
+        hash: packet.hash || '',
+        result: 3 // 3 = accepted
+      });
+      addLog('Resource pack: accepted ✓', 'success');
+
+      // Setelah beberapa detik kirim "loaded"
+      setTimeout(() => {
+        if (!client) return;
+        try {
+          client.write('resource_pack_receive', {
+            hash: packet.hash || '',
+            result: 0 // 0 = successfully loaded
+          });
+          addLog('Resource pack: loaded ✓', 'success');
+        } catch (_) {}
+      }, 2000);
+    } catch (e) {
+      addLog('Gagal accept resource pack: ' + e.message, 'warn');
+    }
   });
 
-  bot.on('kicked', (reason, loggedIn) => {
-    const msg = parseKickReason(reason);
+  // ── Chat ───────────────────────────────────────────────────
+  client.on('chat', (packet) => {
+    try {
+      const msg = typeof packet.message === 'string'
+        ? JSON.parse(packet.message)
+        : packet.message;
+      const text = msg?.text || msg?.translate || JSON.stringify(msg);
+      if (text && !text.includes(config.name)) {
+        addLog(`[Chat] ${text}`, 'info');
+      }
+    } catch (_) {}
+  });
+
+  // ── Keep alive ─────────────────────────────────────────────
+  client.on('keep_alive', (packet) => {
+    try {
+      client.write('keep_alive', { keepAliveId: packet.keepAliveId });
+    } catch (_) {}
+  });
+
+  // ── Kick ──────────────────────────────────────────────────
+  client.on('kick_disconnect', (packet) => {
+    const msg = parseKickReason(packet.reason);
     addLog(`Bot di-kick: ${msg}`, 'error');
     stopAntiIdle();
-    bot = null;
+    client = null;
     botStatus = 'offline';
     scheduleReconnect(msg);
   });
 
-  bot.on('error', (err) => {
+  client.on('disconnect', (packet) => {
+    const msg = parseKickReason(packet.reason);
+    addLog(`Disconnect: ${msg}`, 'error');
+    stopAntiIdle();
+    client = null;
+    botStatus = 'offline';
+    scheduleReconnect(msg);
+  });
+
+  // ── Error & End ───────────────────────────────────────────
+  client.on('error', (err) => {
     addLog('Error: ' + err.message, 'warn');
     stopAntiIdle();
-    bot = null;
+    client = null;
     botStatus = 'error';
     scheduleReconnect(err.message);
   });
 
-  bot.on('end', (reason) => {
-    const wasOnline = botStatus === 'online' || botStatus === 'connecting';
-    if (wasOnline) addLog('Koneksi terputus' + (reason ? ': ' + reason : ''), 'warn');
+  client.on('end', (reason) => {
+    const wasActive = botStatus === 'online' || botStatus === 'connecting';
+    if (wasActive) addLog('Koneksi terputus' + (reason ? ': ' + reason : ''), 'warn');
     stopAntiIdle();
-    bot = null;
-    if (wasOnline) {
+    client = null;
+    if (wasActive) {
       botStatus = 'offline';
       scheduleReconnect(reason || '');
     }
   });
 }
 
-// ── Start / Stop (dipanggil dari API) ────────────────────────
+// ── Start / Stop ─────────────────────────────────────────────
 function startBot() {
   if (autoReconnect) {
     addLog('Bot sudah berjalan.', 'warn');
@@ -211,7 +297,7 @@ function startBot() {
   autoReconnect = true;
   reconnectCount = 0;
   currentDelay = config.reconnectDelay;
-  addLog('Auto-reconnect diaktifkan', 'info');
+  addLog('Memulai bot...', 'info');
   createBot();
   return { ok: true };
 }
@@ -220,27 +306,23 @@ function stopBot() {
   autoReconnect = false;
   cancelReconnect();
   stopAntiIdle();
-  if (bot) {
-    try { bot.clearControlStates(); bot.quit('Stopped by panel'); } catch (_) {}
-    bot = null;
+  if (client) {
+    try { client.end('Stopped by panel'); } catch (_) {}
+    client = null;
   }
   botStatus = 'offline';
   addLog('Bot dihentikan — auto-reconnect dimatikan', 'warn');
   return { ok: true };
 }
 
-// ── API Routes ───────────────────────────────────────────────
+// ── API Routes ────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ message: 'AFK Bot API aktif', status: botStatus });
 });
 
 app.get('/status', (req, res) => {
-  res.json({
-    status: botStatus,
-    autoReconnect,
-    reconnectCount,
-    config: { ip: config.ip, port: config.port, name: config.name, version: config.version }
-  });
+  res.json({ status: botStatus, autoReconnect, reconnectCount,
+    config: { ip: config.ip, port: config.port, name: config.name, version: config.version } });
 });
 
 app.get('/logs', (req, res) => {
@@ -258,7 +340,7 @@ app.post('/stop', (req, res) => {
   res.json({ ...result, status: botStatus });
 });
 
-// ── Start Server ─────────────────────────────────────────────
+// ── Start Server ──────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', () => {
   addLog(`Server API berjalan di port ${PORT}`, 'success');
