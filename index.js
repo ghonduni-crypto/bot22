@@ -155,6 +155,12 @@ function createBot() {
     addLog(`Login berhasil sebagai "${config.name}"`, 'success');
   });
 
+  // Auto-accept resource pack
+  bot.on('resource_pack_push', (pack) => {
+    addLog('Resource pack diterima: ' + (pack.url || 'unknown'), 'info');
+    bot.acceptResourcePack();
+  });
+
   bot.on('spawn', () => {
     addLog('Bot spawn di dunia', 'success');
     bot.clearControlStates();
